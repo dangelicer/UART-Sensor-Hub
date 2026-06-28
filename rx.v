@@ -6,9 +6,6 @@ module rx (
 	input wire [1:0]	id,				// sensors ID, based off of the channel the sensor's connected to
 
 	output reg [10:0]	data_out,		// pushed to queue, id[1:0] | data[7:0] | parity flag | framing flag | overrun flag
-	output reg			parity_err,
-	output reg			framing_err,
-	output reg			overrun_err,
 	output reg			wr_en			// write enable for the queue
 );
 
@@ -23,6 +20,9 @@ module rx (
 
 	reg			[1:0]	state, next_state;
 	reg			[8:0]	data_byte;
+	reg			parity_err;
+	reg			framing_err;
+	reg			overrun_err;
 
 	// current state
 	always @(posedge clk or posedge rst) begin
@@ -46,7 +46,6 @@ module rx (
 			START: begin
 				if (tick == TICK_MIDDLE && ~RX) begin
 					next_state = SAMPLING;
-					tick = 0;
 				end else if (RX) begin
 					next_state = IDLE;
 				end
@@ -54,7 +53,6 @@ module rx (
 			SAMPLING: begin
 				if (tick == TICK_MAX && bit_count == BIT_COUNT_MAX) begin
 					next_state = STOP;
-					tick = 0;
 				end
 			end
 			STOP: begin
