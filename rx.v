@@ -6,7 +6,7 @@ module rx (
 	input wire [1:0]	id,				// sensors ID, based off of the channel the sensor's connected to
 	input wire			tick,			// baud tick
 
-	output reg [10:0]	data_out,		// pushed to queue, id[1:0] | data[7:0] | parity flag | framing flag | overrun flag
+	output reg [12:0]	data_out,		// pushed to queue, id[1:0] | data[7:0] | parity flag | framing flag | overrun flag
 	output reg			wr_en			// write enable for the queue
 );
 
