@@ -70,7 +70,7 @@ module rx (
 		parity_err		= 0;
 		overrun_err		= 0;
 		wr_en			= 0;
-		data_out		= 11'b0;
+		data_out		= 13'b0;
 		tick = 0;
 		bit_count = 0;
 
