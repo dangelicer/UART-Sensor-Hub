@@ -1,5 +1,5 @@
 // Baud tick generator for 9600 baud UART RX with 16x oversampling
-// Target: 100 MHz clock → tick period = 651 cycles → 153,846 Hz → 9615 baud (0.16% error)
+// Target: 100 MHz clock → tick period = 650 cycles → 153,846 Hz → 9600.6 Baud (0.006% error)
 module baud_tick_gen (
     input  wire clk,
     input  wire rst,
