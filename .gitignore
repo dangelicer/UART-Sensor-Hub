@@ -1,0 +1,12 @@
+# Simulation artifacts
+*.vcd
+*.out
+
+# Python
+__pycache__/
+*.pyc
+
+# Vivado project output (if ever generated in-tree)
+*.jou
+*.log
+.Xil/
