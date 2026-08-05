@@ -14,7 +14,7 @@ module sync_fifo #(parameter DEPTH=8, DWIDTH=13)
   reg [$clog2(DEPTH)-1:0]   wptr;
   reg [$clog2(DEPTH)-1:0]   rptr;
 
-  reg [DWIDTH-1 : 0]    fifo[DEPTH];
+  reg [DWIDTH-1 : 0]    fifo [0:DEPTH-1];
 
   always @ (posedge clk) begin
     if (!rstn) begin
