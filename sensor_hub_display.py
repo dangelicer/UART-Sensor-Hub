@@ -22,20 +22,19 @@ idle-disconnecting after a few seconds.
 
 WIRE FORMAT (what the FPGA actually sends)
 ------------------------------------------
-Raw BINARY, two bytes per reading (see fifo_bt_streamer in main.v),
-round-robin between the sensors:
+Raw BINARY, one ambient-light reading per 4-byte frame (see bt_als_framer
+in main.v). The UV sensor is a DFRobot SEN0540 (LTR390-UV) read over Modbus
+by the FPGA; the FPGA forwards each reading as:
 
-    byte 0 (high) : 0 0 0 | id1 id0 | PE | FE | OE
-    byte 1 (low)  : data_byte[7:0]
+    byte 0 : 0xAA        sync
+    byte 1 : als[23:16]  (MSB)
+    byte 2 : als[15:8]
+    byte 3 : als[7:0]    (LSB)
 
-    id (bits 4:3) : 0 = UV sensor  (the IR channel was removed from the FPGA)
-    PE (bit 2)    : parity error flag
-    FE (bit 1)    : framing error flag
-    OE (bit 0)    : overrun error flag  (FIFO was full when this was queued)
-
-The id is small, so a header byte's top nibble is always 0 (<= 0x0F);
-that lets the receiver re-align if a byte is ever dropped.
-The data byte is shown as a decimal value (with hex for reference).
+The reading is the raw ambient-light value (up to 20 bits):
+    als = byte1 << 16 | byte2 << 8 | byte3
+The dashboard converts that raw count to lux (see als_to_lux). The 0xAA
+sync byte lets the receiver re-align if a byte is ever dropped.
 
 USAGE
 -----
@@ -77,72 +76,58 @@ HM10_SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb"
 HM10_CHAR_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"
 DEFAULT_NAME = "DSD TECH"
 
-# --------------------------------------------------------------------------
-# Sensor metadata, keyed by the 2-bit channel id the FPGA tags each reading
-# with (rx.v: UV_ID = 0, IR_ID = 1). Add entries here if you add channels.
-# --------------------------------------------------------------------------
-SENSORS = {
-    0: {"label": "UV Sensor", "unit": ""},
-}
+SENSOR_LABEL = "Ambient Light"
+SYNC = 0xAA
 
-# Live state: sensor_id -> {"data": int, "parity"/"framing"/"overrun": int, "time": float}
-readings = {}
+# --- Ambient-light (ALS) raw-count -> lux ---------------------------------
+# The FPGA configures the LTR390UV for GAIN 3 and 18-bit resolution (100 ms
+# integration) -- see the boot register writes in main.v. The LTR390 / DFRobot
+# ALS-mode lux formula is:
+#     lux = 0.6 * raw / (gain * int_factor)
+# with int_factor = 1.0 for the 18-bit setting. If you change the GAIN or
+# MEAS_RATE writes in main.v, update these constants to match.
+ALS_GAIN = 3.0
+ALS_INT_FACTOR = 1.0
+ALS_WINDOW = 0.6
+
+
+def als_to_lux(raw):
+    return ALS_WINDOW * raw / (ALS_GAIN * ALS_INT_FACTOR)
+
+# Live state: the latest ambient-light reading.
+reading = {"als": None, "time": 0.0}
 stats = {
     "bytes": 0,     # raw bytes received
-    "words": 0,     # complete 2-byte readings decoded
-    "resync": 0,    # bytes skipped to re-align to a packet boundary
-    "parity": 0,    # readings that arrived with a parity error
-    "framing": 0,   # ... framing error
-    "overrun": 0,   # ... overrun error
+    "frames": 0,    # complete 4-byte frames decoded
+    "resync": 0,    # bytes skipped while hunting for a 0xAA sync
 }
 
-# Byte-stream decoder state: the header byte awaiting its data byte.
-_pending_hi = None
+# Decoder state: None = waiting for the 0xAA sync; else the data bytes so far.
+_buf = None
 
 
 # --------------------------------------------------------------------------
-# DECODE  ->  turn a (high, low) byte pair into a stored reading.
-# --------------------------------------------------------------------------
-def decode_word(hi, lo):
-    sensor_id = (hi >> 3) & 0x03
-    parity = (hi >> 2) & 0x01
-    framing = (hi >> 1) & 0x01
-    overrun = hi & 0x01
-
-    readings[sensor_id] = {
-        "data": lo,               # raw 8-bit value
-        "parity": parity,
-        "framing": framing,
-        "overrun": overrun,
-        "time": time.time(),
-    }
-    stats["words"] += 1
-    if parity:
-        stats["parity"] += 1
-    if framing:
-        stats["framing"] += 1
-    if overrun:
-        stats["overrun"] += 1
-
-
-# --------------------------------------------------------------------------
-# INGEST  ->  feed raw bytes; pairs them into readings and self-aligns.
-# A valid header byte has a zero top nibble (only ids 0/1 are used, so
-# bits 7:4 are always 0). Anything else while we expect a header is byte
-# slippage -> skip it and try to re-sync on the next byte.
+# INGEST  ->  feed raw bytes; assemble 0xAA + 3-byte frames and self-align.
+# While waiting for a frame we skip anything that isn't the 0xAA sync byte;
+# once synced we collect the next 3 bytes as the 24-bit ambient-light value.
 # --------------------------------------------------------------------------
 def handle_bytes(chunk):
-    global _pending_hi
+    global _buf
     for b in chunk:
         stats["bytes"] += 1
-        if _pending_hi is None:
-            if (b & 0xF0) != 0x00:
-                stats["resync"] += 1      # not a plausible header; drop to re-align
-                continue
-            _pending_hi = b
+        if _buf is None:
+            if b == SYNC:
+                _buf = []
+            else:
+                stats["resync"] += 1      # not a sync byte; skip to re-align
         else:
-            decode_word(_pending_hi, b)
-            _pending_hi = None
+            _buf.append(b)
+            if len(_buf) == 3:
+                als = (_buf[0] << 16) | (_buf[1] << 8) | _buf[2]
+                reading["als"] = als
+                reading["time"] = time.time()
+                stats["frames"] += 1
+                _buf = None
 
 
 # --------------------------------------------------------------------------
@@ -152,51 +137,27 @@ def handle_bytes(chunk):
 def render(status_note=""):
     # \033[H moves cursor to top-left, \033[J clears from there down.
     out = ["\033[H\033[J"]
-    width = 46
+    width = 50
     now = time.time()
 
     out.append("╔" + "═" * width + "╗")
     out.append("║" + "UART SENSOR HUB".center(width) + "║")
     out.append("╠" + "═" * width + "╣")
 
-    # Known channels in id order, plus any unexpected ids the FPGA sent.
-    ids = list(SENSORS.keys())
-    for sid in readings:
-        if sid not in ids:
-            ids.append(sid)
-
-    for sid in ids:
-        label = SENSORS.get(sid, {}).get("label", f"Channel {sid}")
-        unit = SENSORS.get(sid, {}).get("unit", "")
-        data = readings.get(sid)
-
-        if data is None:
-            line = f"   {label:<10} -- no data --"
-        else:
-            raw = data["data"]
-            # Show the byte as a decimal number (hex kept in parens for reference).
-            value_str = f"{raw:>3} (0x{raw:02X}) {unit}".rstrip()
-            flags = []
-            if data["parity"]:
-                flags.append("PAR")
-            if data["framing"]:
-                flags.append("FRM")
-            if data["overrun"]:
-                flags.append("OVR")
-            flag_str = ("ERR:" + ",".join(flags)) if flags else "ok"
-            age = now - data["time"]
-            age_mark = "●" if age < 3 else "○"   # fresh (<3s) vs stale
-            line = f" {age_mark} {label:<10} {value_str:<15} {flag_str}"
-
-        out.append("║" + line.ljust(width)[:width] + "║")
+    als = reading["als"]
+    if als is None:
+        line = f"   {SENSOR_LABEL:<14} -- no data --"
+    else:
+        lux = als_to_lux(als)
+        age = now - reading["time"]
+        age_mark = "●" if age < 3 else "○"   # fresh (<3s) vs stale
+        line = f" {age_mark} {SENSOR_LABEL:<14} {lux:>9.1f} lux  (raw {als})"
+    out.append("║" + line.ljust(width)[:width] + "║")
 
     out.append("╠" + "═" * width + "╣")
-    status = (f" words:{stats['words']} bytes:{stats['bytes']} "
+    status = (f" frames:{stats['frames']} bytes:{stats['bytes']} "
               f"resync:{stats['resync']}")
     out.append("║" + status.ljust(width)[:width] + "║")
-    errs = (f" errs  parity:{stats['parity']} framing:{stats['framing']} "
-            f"overrun:{stats['overrun']}")
-    out.append("║" + errs.ljust(width)[:width] + "║")
     clock = " " + datetime.now().strftime("%H:%M:%S") + "   ● live   ○ stale"
     out.append("║" + clock.ljust(width)[:width] + "║")
     out.append("╚" + "═" * width + "╝")
@@ -290,27 +251,23 @@ def run_scan():
 
 
 # --------------------------------------------------------------------------
-# SIMULATION MODE  ->  no hardware; synthesizes the SAME 2-byte binary
-# packets the FPGA emits and feeds them through the real decode path.
+# SIMULATION MODE  ->  no hardware; synthesizes the SAME 4-byte frames the
+# FPGA emits and feeds them through the real decode path.
 # --------------------------------------------------------------------------
-def make_packet(sensor_id, data, parity=0, framing=0, overrun=0):
-    hi = ((sensor_id & 0x03) << 3) | (parity << 2) | (framing << 1) | overrun
-    return bytes([hi & 0xFF, data & 0xFF])
+def make_frame(als):
+    als &= 0xFFFFFF
+    return bytes([SYNC, (als >> 16) & 0xFF, (als >> 8) & 0xFF, als & 0xFF])
 
 
 def run_simulation():
-    print("Simulation mode - generating fake sensor packets. Ctrl+C to quit.")
+    print("Simulation mode - generating fake ambient-light frames. Ctrl+C to quit.")
     time.sleep(1)
-    state = {0: 40}   # id -> current raw value (UV only)
+    als = 12000                        # raw ambient-light value
     last_draw = 0
     try:
         while True:
-            for sid in state:
-                state[sid] = max(0, min(255, state[sid] + random.randint(-8, 8)))
-                # Inject an occasional error flag so the dashboard shows them off.
-                parity = 1 if random.random() < 0.05 else 0
-                framing = 1 if random.random() < 0.02 else 0
-                handle_bytes(make_packet(sid, state[sid], parity, framing))
+            als = max(0, min(0xFFFFF, als + random.randint(-800, 800)))
+            handle_bytes(make_frame(als))
             if time.time() - last_draw > 0.1:
                 render(" SIMULATION")
                 last_draw = time.time()

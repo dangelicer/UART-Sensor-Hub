@@ -1,66 +1,66 @@
 `timescale 1ns / 1ps
 //======================================================================
-// main_tb.v  --  integration testbench for `main` (UART Sensor Hub top)
+// main_tb.v  --  integration testbench for `main` (LTR390UV Modbus hub)
 //
-// End-to-end path exercised (UV channel):
-//   TB drives a UART frame onto uv_dt
-//     -> sync_2ff -> rx -> sync_fifo -> fifo_bt_streamer -> uart_tx
-//     -> TB decodes the two bytes that appear on bt_tx.
+// Models the DFRobot SEN0540 as a Modbus RTU slave on the UV UART:
+//   - receives the FPGA's request bytes on uv_cr (FPGA TX),
+//   - echoes Write-Single (0x06) requests,
+//   - answers the Read (0x04) request with a canned ALS value.
+// Then checks that:
+//   (a) the FPGA issued the exact ambient-light boot sequence, and
+//   (b) the FPGA emits the correct Bluetooth frame 0xAA + 3 ALS bytes.
 //
-// Oracle independence (Rule 7):
-//   - Byte VALUES driven in are chosen by the TB, not read from the RTL.
-//   - Expected parity is computed with an explicit XOR chain
-//     (d0^d1^...^d7), a DIFFERENT expression than the DUT's `^{...}`
-//     reduction, so a typo in one is not mirrored in the other.
-//   - The expected BT framing {3'b0,id,parity,framing,overrun}+data is
-//     built from the protocol/word spec documented in rx.v and main.v,
-//     independent of how the streamer computes it.
+// Oracle independence: the ALS value and expected boot registers are
+// TB constants (from the datasheet/driver), not read from the RTL.
+// The slave-side CRC uses an explicit loop, separate from the DUT.
 //
-// Timing: 9600 baud @ 100 MHz -> 10416 clk/bit. This equals both the
-//   protocol value round(100e6/9600) and the DUT's own bit period
-//   (16 oversample ticks x 651-clk baud_tick_gen period). Stimulus is
-//   driven on negedge (Rule 5); bt_tx is sampled at mid-bit.
-//
-// NOTE: only declared DUT inputs are driven (Rule 1); no hierarchical
-//   writes anywhere (Rule 2). All comparisons use === with X-guards
-//   (Rule 4). The IR channel was removed from the design, so this bench
-//   exercises the UV channel only.
-//
-// Run: iverilog -g2012 -o main_tb.out main_tb.v main.v rx.v fifo.v \
-//               baud_tick_gen.v basys3_sensors.v && vvp main_tb.out
+// Run: iverilog -g2012 -o main_tb.out main_tb.v main.v \
+//        modbus_rtu_master.v basys3_sensors.v && vvp main_tb.out
 //======================================================================
 module main_tb;
 
-    localparam integer CLKS_PER_BIT = 10416;               // 9600 baud @ 100 MHz
-    // The BT transmission only begins near the END of the input frame (the
-    // FIFO write happens on the last received bit), and the capture thread
-    // runs concurrently with the whole frame (Rule 6), so the window to see
-    // a start bit must span an entire input frame plus margin.
-    localparam integer START_TIMEOUT = 20 * CLKS_PER_BIT;
+    // To keep simulation fast, the DUT is told CLK_HZ = 1 MHz (below) while
+    // still clocked at 100 MHz here, so a bit is BIT_TICKS = 1e6/9600 = 104
+    // clocks (~104 real clocks) instead of ~10416. BIT_NS matches: 104 * 10ns.
+    localparam integer BIT_NS = 1040;            // one bit period (ns) for the slave/BT
+    localparam [23:0]  ALS_TEST = 24'h012345;    // reg0=0x2345, reg1=0x0001
 
-    localparam [1:0] UV_ID = 2'b00;
-
-    // DUT inputs (driven) and outputs (observed)
     reg  clk;
     reg  rst;
     reg  sw_uv_off;
-    reg  uv_dt;
+    reg  uv_dt;     // sensor -> FPGA (TB drives)
     reg  bt_rx;
-    wire uv_cr;
+    wire uv_cr;     // FPGA -> sensor (TB samples)
     wire bt_tx;
     wire [15:0] led;
 
     integer pass_count;
     integer fail_count;
+    integer i;
 
-    // capture scratch
-    reg [7:0] cap_hi, cap_lo, cap_byte;
-    reg       got_hi, got_lo, got_byte;
+    // Recorded requests seen by the slave (first 4: 3 writes + 1 read)
+    reg [7:0]  seen_func [0:3];
+    reg [15:0] seen_reg  [0:3];
+    reg [15:0] seen_data [0:3];
+    integer    req_count;
+
+    reg [7:0] req [0:7];
+    reg [7:0] resp7 [0:6];
+    reg [15:0] c;
+
+    // BT frame capture
+    reg [7:0] f0, f1, f2, f3;
 
     //------------------------------------------------------------------
-    // DUT
+    // DUT -- delays shrunk for fast simulation
     //------------------------------------------------------------------
-    main dut (
+    main #(
+        .CLK_HZ         (1_000_000),   // fictional (sim speed): 104 clk/bit, not 10416
+        .BAUD           (9600),
+        .UV_TIMEOUT_MS  (5),           // -> 5000 clk timeout (> response latency)
+        .UV_BOOT_CYCLES (2000),
+        .UV_POLL_CYCLES (2000)
+    ) dut (
         .clk       (clk),
         .rst       (rst),
         .sw_uv_off (sw_uv_off),
@@ -71,229 +71,191 @@ module main_tb;
         .led       (led)
     );
 
-    // 100 MHz clock
     always #5 clk = ~clk;
 
     //------------------------------------------------------------------
-    // Independent even-parity reference: explicit XOR chain.
-    // (DUT uses a reduction `^{data_byte,RX}` -- deliberately different.)
+    // Independent Modbus CRC-16 (explicit loop) over the 7 payload bytes
     //------------------------------------------------------------------
-    function even_parity;
-        input [7:0] d;
+    function [15:0] crc16_7;
+        input [7:0] b0,b1,b2,b3,b4,b5,b6;
+        integer j,k;
+        reg [15:0] cc;
+        reg [7:0] bytes [0:6];
         begin
-            even_parity = d[0]^d[1]^d[2]^d[3]^d[4]^d[5]^d[6]^d[7];
+            bytes[0]=b0; bytes[1]=b1; bytes[2]=b2; bytes[3]=b3;
+            bytes[4]=b4; bytes[5]=b5; bytes[6]=b6;
+            cc = 16'hFFFF;
+            for (j=0;j<7;j=j+1) begin
+                cc = cc ^ {8'h00, bytes[j]};
+                for (k=0;k<8;k=k+1)
+                    cc = cc[0] ? (cc>>1)^16'hA001 : (cc>>1);
+            end
+            crc16_7 = cc;
         end
     endfunction
 
     //------------------------------------------------------------------
-    // Stimulus helpers (drive uv_dt only)
+    // Slave UART helpers (time-based, decoupled from the FPGA clock)
     //------------------------------------------------------------------
-    task drive_bit;
-        input b;
+    task uart_send_dt;                 // drive one byte on uv_dt, 8N1 LSB-first
+        input [7:0] b;
+        integer n;
         begin
-            @(negedge clk);
-            uv_dt = b;
-            repeat (CLKS_PER_BIT) @(posedge clk);
+            uv_dt = 1'b0; #BIT_NS;          // start
+            for (n=0;n<8;n=n+1) begin uv_dt = b[n]; #BIT_NS; end
+            uv_dt = 1'b1; #BIT_NS;          // stop
         end
     endtask
 
-    // 8N1-with-parity frame: start(0), 8 data LSB-first, parity, stop(1).
-    // pbit is sent as-is so the caller can inject a good or bad parity bit.
-    // Trailing idle bit gives rx time to finish STOP and write the FIFO.
-    task send_uart_frame;
-        input [7:0] data;
-        input       pbit;
-        integer     i;
-        begin
-            drive_bit(1'b0);
-            for (i = 0; i < 8; i = i + 1) drive_bit(data[i]);
-            drive_bit(pbit);
-            drive_bit(1'b1);
-            drive_bit(1'b1);
-        end
-    endtask
-
-    // Send a frame while concurrently capturing the two BT bytes it
-    // produces (Rule 6: the capture thread must be listening BEFORE the
-    // streamer starts, which happens before the frame send returns).
-    task send_capture2;
-        input [7:0] data;
-        input       pbit;
-        begin
-            cap_hi = 8'h00; cap_lo = 8'h00; got_hi = 1'b0; got_lo = 1'b0;
-            fork
-                send_uart_frame(data, pbit);
-                begin
-                    bt_get_byte(cap_hi, got_hi);
-                    bt_get_byte(cap_lo, got_lo);
-                end
-            join
-        end
-    endtask
-
-    // Send a frame and confirm NO BT byte comes out (disabled channel).
-    task send_capture_none;
-        input [7:0] data;
-        input       pbit;
-        begin
-            cap_byte = 8'h00; got_byte = 1'b0;
-            fork
-                send_uart_frame(data, pbit);
-                bt_get_byte(cap_byte, got_byte);
-            join
-        end
-    endtask
-
-    //------------------------------------------------------------------
-    // Decode one UART byte off bt_tx (idle high). Returns got=0 if no
-    // start bit appears within START_TIMEOUT clocks.
-    //------------------------------------------------------------------
-    task bt_get_byte;
+    task uart_recv_cr;                 // receive one byte from uv_cr, 8N1
         output [7:0] b;
-        output       got;
-        integer      i, t;
+        integer n;
         begin
-            b   = 8'h00;
-            got = 1'b0;
-            t   = 0;
-            // wait for falling edge (start bit)
-            while (bt_tx === 1'b1 && t < START_TIMEOUT) begin
-                @(posedge clk);
-                t = t + 1;
+            @(negedge uv_cr);              // start bit
+            #(BIT_NS/2);                   // mid start
+            for (n=0;n<8;n=n+1) begin #BIT_NS; b[n] = uv_cr; end
+            #BIT_NS;                       // ride out stop
+        end
+    endtask
+
+    //------------------------------------------------------------------
+    // Slave model: receive request, respond per function code
+    //------------------------------------------------------------------
+    initial begin
+        uv_dt = 1'b1;
+        req_count = 0;
+        @(negedge rst);                    // wait for reset to release
+        forever begin
+            for (i=0;i<8;i=i+1) uart_recv_cr(req[i]);
+            if (req_count < 4) begin
+                seen_func[req_count] <= req[1];
+                seen_reg [req_count] <= {req[2], req[3]};
+                seen_data[req_count] <= {req[4], req[5]};
+                req_count = req_count + 1;
             end
-            if (bt_tx === 1'b0) begin
-                // move to the middle of the start bit, then sample each bit
-                repeat (CLKS_PER_BIT/2) @(posedge clk);
-                for (i = 0; i < 8; i = i + 1) begin
-                    repeat (CLKS_PER_BIT) @(posedge clk);
-                    b[i] = bt_tx;                 // LSB first
-                end
-                repeat (CLKS_PER_BIT) @(posedge clk); // ride out the stop bit
-                got = 1'b1;
+            #(BIT_NS);                      // processing gap
+            if (req[1] == 8'h06) begin
+                // Write Single: echo the 8-byte request back
+                for (i=0;i<8;i=i+1) uart_send_dt(req[i]);
+            end else if (req[1] == 8'h04) begin
+                // Read Input Regs: respond with the canned ALS value
+                resp7[0]=8'h1C; resp7[1]=8'h04; resp7[2]=8'h04;
+                resp7[3]=ALS_TEST[15:8];  // reg0 high
+                resp7[4]=ALS_TEST[7:0];   // reg0 low
+                resp7[5]=8'h00;           // reg1 high
+                resp7[6]=ALS_TEST[23:16]; // reg1 low
+                for (i=0;i<7;i=i+1) uart_send_dt(resp7[i]);
+                c = crc16_7(resp7[0],resp7[1],resp7[2],resp7[3],resp7[4],resp7[5],resp7[6]);
+                uart_send_dt(c[7:0]);
+                uart_send_dt(c[15:8]);
             end
+        end
+    end
+
+    //------------------------------------------------------------------
+    // Capture one BT byte and one 4-byte frame
+    //------------------------------------------------------------------
+    task bt_get;
+        output [7:0] b;
+        integer n;
+        begin
+            @(negedge bt_tx);
+            #(BIT_NS/2);
+            for (n=0;n<8;n=n+1) begin #BIT_NS; b[n] = bt_tx; end
+            #BIT_NS;
+        end
+    endtask
+
+    task bt_recv_frame;
+        begin
+            bt_get(f0); bt_get(f1); bt_get(f2); bt_get(f3);
         end
     endtask
 
     //------------------------------------------------------------------
     // Checks
     //------------------------------------------------------------------
-    task check_byte;
-        input [7:0]  got_val;
-        input        valid;
-        input [7:0]  exp;
-        input integer tnum;
+    task chk8;
+        input [7:0] got, exp;
+        input [127:0] name;
         begin
-            if (!valid) begin
-                $display("FAIL [t%0d]: expected 0x%02h but no BT byte was captured (timeout)", tnum, exp);
+            if (got === 8'bx || (^got) === 1'bx) begin
+                $display("FAIL [%0s]: value is X", name);
                 fail_count = fail_count + 1;
-            end else if (got_val === 8'bx || (^got_val) === 1'bx) begin
-                $display("FAIL [t%0d]: captured byte is X (indeterminate)", tnum);
-                fail_count = fail_count + 1;
-            end else if (got_val === exp) begin
-                $display("PASS [t%0d]: BT byte 0x%02h", tnum, got_val);
+            end else if (got === exp) begin
+                $display("PASS [%0s]: 0x%02h", name, got);
                 pass_count = pass_count + 1;
             end else begin
-                $display("FAIL [t%0d]: expected 0x%02h, got 0x%02h", tnum, exp, got_val);
+                $display("FAIL [%0s]: expected 0x%02h, got 0x%02h", name, exp, got);
                 fail_count = fail_count + 1;
             end
         end
     endtask
 
-    // Build the expected BT high byte for a channel word.
-    function [7:0] exp_hi;
-        input [1:0] id;
-        input [7:0] data;
-        input       pbit;   // parity bit actually sent
-        input       stopb;  // stop bit actually sent
-        reg         perr, ferr;
+    task chk16;
+        input [15:0] got, exp;
+        input [127:0] name;
         begin
-            perr  = even_parity(data) ^ pbit;   // 0 if sent parity matches even parity
-            ferr  = ~stopb;                      // framing error = stop sampled low
-            exp_hi = {3'b000, id, perr, ferr, 1'b0}; // overrun = 0 (FIFO never full here)
-        end
-    endfunction
-
-    //------------------------------------------------------------------
-    // Reset
-    //------------------------------------------------------------------
-    task do_reset;
-        begin
-            rst = 1'b1;
-            repeat (5) @(posedge clk);
-            @(negedge clk);
-            rst = 1'b0;
-            repeat (5) @(posedge clk);
+            if (got === exp) begin
+                $display("PASS [%0s]: 0x%04h", name, got);
+                pass_count = pass_count + 1;
+            end else begin
+                $display("FAIL [%0s]: expected 0x%04h, got 0x%04h", name, exp, got);
+                fail_count = fail_count + 1;
+            end
         end
     endtask
 
-    //------------------------------------------------------------------
-    // Waveforms + global timeout
     //------------------------------------------------------------------
     initial begin
         $dumpfile("main_tb.vcd");
         $dumpvars(0, main_tb);
     end
-
     initial begin
-        #60_000_000;
-        $display("TIMEOUT: simulation ran too long");
+        #3_000_000;
+        $display("TIMEOUT (stalled)");
         $display("RESULT: %0d/%0d checks passed", pass_count, pass_count + fail_count);
         $finish;
     end
 
     //------------------------------------------------------------------
-    // Test sequence (UV channel, id 0)
-    //------------------------------------------------------------------
     initial begin
-        clk        = 1'b0;
-        rst        = 1'b0;
-        sw_uv_off  = 1'b0;   // UV enabled
-        uv_dt      = 1'b1;   // UART idle high
-        bt_rx      = 1'b1;   // host->hub line idle (unused)
-        pass_count = 0;
-        fail_count = 0;
+        clk = 0; rst = 0; sw_uv_off = 0; bt_rx = 1;
+        pass_count = 0; fail_count = 0;
 
-        do_reset();
-        $display("Reset complete, starting integration tests");
-
-        // ---- Test 1: UV good frame, 0x3C ----
-        // word {id=00, data=3C, parity=0, framing=0, overrun=0} -> hi=0x00, lo=0x3C.
-        send_capture2(8'h3C, even_parity(8'h3C));
-        check_byte(cap_hi, got_hi, exp_hi(UV_ID, 8'h3C, even_parity(8'h3C), 1'b1), 1);
-        check_byte(cap_lo, got_lo, 8'h3C, 1);
-
-        // ---- Test 2: UV good frame, 0xA5 (bit7=1 -> bug-sensitive MSB) ----
-        // hi=0x00, lo=0xA5. Confirms the top data bit survives the pipeline.
-        send_capture2(8'hA5, even_parity(8'hA5));
-        check_byte(cap_hi, got_hi, exp_hi(UV_ID, 8'hA5, even_parity(8'hA5), 1'b1), 2);
-        check_byte(cap_lo, got_lo, 8'hA5, 2);
-
-        // ---- Test 3: UV frame with WRONG parity bit (bug-sensitive) ----
-        // Send ~even_parity -> DUT must flag parity_err=1 -> hi=0x04, lo=0xA5.
-        // A DUT that ignored parity would send 0x00.
-        send_capture2(8'hA5, ~even_parity(8'hA5));
-        check_byte(cap_hi, got_hi, exp_hi(UV_ID, 8'hA5, ~even_parity(8'hA5), 1'b1), 3);
-        check_byte(cap_lo, got_lo, 8'hA5, 3);
-
-        // ---- Test 4: UV channel DISABLED -> no BT output ----
-        // sw_uv_off high gates the FIFO write; sending a full frame must
-        // produce NO byte on bt_tx (got stays 0).
-        sw_uv_off = 1'b1;
+        rst = 1'b1;
+        repeat (5) @(posedge clk);
         @(negedge clk);
-        send_capture_none(8'h5A, even_parity(8'h5A));
-        if (!got_byte) begin
-            $display("PASS [t4]: disabled UV channel produced no BT output");
-            pass_count = pass_count + 1;
-        end else begin
-            $display("FAIL [t4]: disabled UV channel still emitted 0x%02h", cap_byte);
-            fail_count = fail_count + 1;
-        end
-        sw_uv_off = 1'b0;
+        rst = 1'b0;
+        $display("Reset released, waiting for boot + first ALS reading...");
 
-        // ---- Test 5: re-enable UV, confirm channel recovers ----
-        send_capture2(8'h81, even_parity(8'h81)); // 0x81: bits 7 and 0 set
-        check_byte(cap_hi, got_hi, exp_hi(UV_ID, 8'h81, even_parity(8'h81), 1'b1), 5);
-        check_byte(cap_lo, got_lo, 8'h81, 5);
+        // First BT frame appears only after the 3 config writes and a read.
+        bt_recv_frame();
+
+        // (a) Boot sequence content
+        chk8 (seen_func[0], 8'h06,   "boot1 func");
+        chk16(seen_reg [0], 16'h000D,"boot1 reg (MEAS_RATE)");
+        chk16(seen_data[0], 16'h0022,"boot1 val");
+        chk8 (seen_func[1], 8'h06,   "boot2 func");
+        chk16(seen_reg [1], 16'h0006,"boot2 reg (GAIN)");
+        chk16(seen_data[1], 16'h0001,"boot2 val");
+        chk8 (seen_func[2], 8'h06,   "boot3 func");
+        chk16(seen_reg [2], 16'h000E,"boot3 reg (MAIN_CTRL)");
+        chk16(seen_data[2], 16'h0002,"boot3 val");
+        chk8 (seen_func[3], 8'h04,   "read func");
+        chk16(seen_reg [3], 16'h0007,"read reg (ALS_DATA_LOW)");
+        chk16(seen_data[3], 16'h0002,"read count");
+
+        // (b) BT frame: 0xAA sync + ALS MSB..LSB
+        chk8(f0, 8'hAA,            "BT sync");
+        chk8(f1, ALS_TEST[23:16], "BT als[23:16]");
+        chk8(f2, ALS_TEST[15:8],  "BT als[15:8]");
+        chk8(f3, ALS_TEST[7:0],   "BT als[7:0]");
+
+        // Confirm polling repeats: a second frame should arrive
+        bt_recv_frame();
+        chk8(f0, 8'hAA,            "BT sync (2nd)");
+        chk8(f3, ALS_TEST[7:0],   "BT als[7:0] (2nd)");
 
         $display("RESULT: %0d/%0d checks passed", pass_count, pass_count + fail_count);
         $finish;

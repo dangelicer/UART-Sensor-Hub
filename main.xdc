@@ -29,16 +29,16 @@ set_property -dict { PACKAGE_PIN G2  IOSTANDARD LVCMOS33 } [get_ports uv_cr] ;# 
 set_property -dict { PACKAGE_PIN P18 IOSTANDARD LVCMOS33 } [get_ports bt_tx] ;# JC4 , FPGA -> HM-10 RXD
 set_property -dict { PACKAGE_PIN N17 IOSTANDARD LVCMOS33 } [get_ports bt_rx] ;# JC3 , HM-10 TXD -> FPGA (unused)
 
-## Debug status LEDs (user LEDs LD0-LD15)
-set_property -dict { PACKAGE_PIN U16 IOSTANDARD LVCMOS33 } [get_ports {led[0]}]  ;# LD0  heartbeat
-set_property -dict { PACKAGE_PIN E19 IOSTANDARD LVCMOS33 } [get_ports {led[1]}]  ;# LD1  UV input activity
+## Status LED (only LD0 is used: blinks on each Bluetooth byte transmitted)
+set_property -dict { PACKAGE_PIN U16 IOSTANDARD LVCMOS33 } [get_ports {led[0]}]  ;# LD0  BT TX activity
+set_property -dict { PACKAGE_PIN E19 IOSTANDARD LVCMOS33 } [get_ports {led[1]}]  ;# LD1  (unused)
 set_property -dict { PACKAGE_PIN U19 IOSTANDARD LVCMOS33 } [get_ports {led[2]}]  ;# LD2  (unused)
-set_property -dict { PACKAGE_PIN V19 IOSTANDARD LVCMOS33 } [get_ports {led[3]}]  ;# LD3  UV word captured
+set_property -dict { PACKAGE_PIN V19 IOSTANDARD LVCMOS33 } [get_ports {led[3]}]  ;# LD3  (unused)
 set_property -dict { PACKAGE_PIN W18 IOSTANDARD LVCMOS33 } [get_ports {led[4]}]  ;# LD4  (unused)
-set_property -dict { PACKAGE_PIN U15 IOSTANDARD LVCMOS33 } [get_ports {led[5]}]  ;# LD5  UV FIFO non-empty
+set_property -dict { PACKAGE_PIN U15 IOSTANDARD LVCMOS33 } [get_ports {led[5]}]  ;# LD5  (unused)
 set_property -dict { PACKAGE_PIN U14 IOSTANDARD LVCMOS33 } [get_ports {led[6]}]  ;# LD6  (unused)
-set_property -dict { PACKAGE_PIN V14 IOSTANDARD LVCMOS33 } [get_ports {led[7]}]  ;# LD7  BT TX activity
-set_property -dict { PACKAGE_PIN V13 IOSTANDARD LVCMOS33 } [get_ports {led[8]}]  ;# LD8  UV trigger firing
+set_property -dict { PACKAGE_PIN V14 IOSTANDARD LVCMOS33 } [get_ports {led[7]}]  ;# LD7  (unused)
+set_property -dict { PACKAGE_PIN V13 IOSTANDARD LVCMOS33 } [get_ports {led[8]}]  ;# LD8  (unused)
 set_property -dict { PACKAGE_PIN V3  IOSTANDARD LVCMOS33 } [get_ports {led[9]}]
 set_property -dict { PACKAGE_PIN W3  IOSTANDARD LVCMOS33 } [get_ports {led[10]}]
 set_property -dict { PACKAGE_PIN U3  IOSTANDARD LVCMOS33 } [get_ports {led[11]}]

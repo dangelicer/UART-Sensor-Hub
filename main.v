@@ -1,167 +1,136 @@
 `timescale 1ns / 1ps
 //======================================================================
-// main.v  --  Basys3 UART Sensor Hub (UV channel), top-level integration
+// main.v  --  Basys3 UART Sensor Hub (UV ambient light), top-level
 //
-// Data path:
+// The UV sensor is a DFRobot SEN0540 (LTR390-UV) in UART/Modbus-RTU mode
+// at slave address 0x1C, 9600 8N1. It is NOT a raw-UART device, so the
+// data path is a Modbus RTU master, not rx.v:
 //
-//   UV sensor (JA3 D-T) --> 2FF sync --> rx (id 0) --> sync_fifo --> BT
-//                                                                 streamer
-//   baud_tick_gen -> 16x baud tick -> rx                             |
-//                                                          uart_tx -> HM-10 (JC4)
+//   ltr390_seq  --drives-->  modbus_rtu_master  <--UART-->  UV sensor
+//        |                         (JA4 tx, JA3 rx)
+//        | als, als_valid
+//        v
+//   bt_als_framer --> uart_tx --> HM-10 Bluetooth (JC4)
 //
-// Sensor trigger (uart_tx + echo_pulse_ctrl from basys3_sensors.v):
-//   UV is triggered: echo_pulse_ctrl polls every UV_POLL_MS, uart_tx
-//   sends UV_TRIGGER_CMD out on JA4 (C-R); the reply comes back on
-//   JA3 (D-T) through the rx pipeline above. basys3_sensors.v's own
-//   uart_rx / uart_sensor_ctrl receive path is NOT used -- rx.v is the
-//   receiver.
+// Boot sequence (Modbus Write Single Register, func 0x06):
+//   1. reg 0x0D (MEAS_RATE) = 0x0022   (18-bit, 100 ms)
+//   2. reg 0x06 (GAIN)      = 0x0001   (gain 3)
+//   3. reg 0x0E (MAIN_CTRL) = 0x0002   (ALS / ambient-light mode)
+// Then poll (Read Input Registers, func 0x04): regs 0x07..0x08, and
+//   ALS raw = reg[0x07] | (reg[0x08] << 16).
 //
-// NOTE: the IR channel was removed -- that sensor's output is not UART,
-// so it cannot be received by rx.v.
+// Bluetooth output frame (per reading): 0xAA, als[23:16], als[15:8],
+//   als[7:0]  -- the 0xAA sync byte lets the host re-align.
 //
-// Switch (up/high = sensor OFF):
-//   sw_uv_off (SW15, pin R2)  -> disable UV channel = gate the FIFO
-//   writes and stop sending trigger pulses. It does NOT cut power: on a
-//   standard Basys3 Pmod, pins 5/11 are GND and 6/12 are VCC (fixed
-//   rails), so JA5/JA6 (sensor GND/VCC) come straight from the board.
+// Switch: sw_uv_off (SW15, R2) high = disable the UV master (idle).
 //
-// Pin/power notes: only JA3, JA4, JC3, JC4 are real FPGA I/O. The
-// power/ground pins in the wiring plan (JA5/6, JC5/6) are the Pmod
-// connector's own VCC/GND rails -- no ports for them.
-// See main.xdc for the pin constraints.
+// Pins: only JA3 (uv_dt), JA4 (uv_cr), JC3 (bt_rx), JC4 (bt_tx) are real
+// FPGA I/O; sensor/HM-10 power+ground are the Pmod VCC/GND rails.
+// See main.xdc.
+//
+// NOTE: the raw-UART path (baud_tick_gen, rx.v, fifo.v, fifo_bt_streamer)
+// and the IR channel are no longer instantiated -- kept in the repo for
+// reference/reuse only.
 //======================================================================
 module main #(
     parameter integer CLK_HZ         = 100_000_000,
     parameter integer BAUD           = 9600,
-    parameter integer UV_POLL_MS     = 250,        // UV trigger cadence
-    parameter [7:0]   UV_TRIGGER_CMD = 8'h09,      // UV sensor command byte (per datasheet)
-    parameter [1:0]   UV_ID          = 2'b00,
-    parameter integer FIFO_DEPTH     = 8,
-    parameter integer FIFO_WIDTH     = 13
+    parameter integer UV_TIMEOUT_MS  = 50,          // Modbus response timeout
+    parameter integer UV_BOOT_CYCLES = 20_000_000,  // ~200 ms power-up settle
+    parameter integer UV_POLL_CYCLES = 20_000_000   // ~200 ms between reads
 ) (
     input  wire clk,          // W5  , 100 MHz onboard oscillator
     input  wire rst,          // U18 , btnC, active-high reset
 
-    // Channel-disable switch (high/up = OFF)
-    input  wire sw_uv_off,    // R2  , SW15
+    input  wire sw_uv_off,    // R2  , SW15  (high = UV OFF)
 
-    // UV sensor (Pmod JA) -- two-wire UART, triggered
-    input  wire uv_dt,        // JA3 (J2), UV -> FPGA data   (D-T)
-    output wire uv_cr,        // JA4 (G2), FPGA -> UV trigger (C-R)
+    // UV sensor (Pmod JA) -- Modbus RTU over UART
+    input  wire uv_dt,        // JA3 (J2), UV -> FPGA  (sensor TXD)
+    output wire uv_cr,        // JA4 (G2), FPGA -> UV  (sensor RXD)
 
     // HM-10 Bluetooth (Pmod JC)
     output wire bt_tx,        // JC4 (P18), FPGA -> HM-10 RXD
-    input  wire bt_rx,        // JC3 (N17), HM-10 TXD -> FPGA (unused for now)
+    input  wire bt_rx,        // JC3 (N17), HM-10 TXD -> FPGA (unused)
 
-    // Debug status LEDs (LD0-LD15) -- pipeline visibility map, see below
+    // Debug status LEDs (LD0-LD15) -- pipeline map, see below
     output wire [15:0] led
 );
 
-    // Enable (switch high = OFF -> enable is the inverse)
     wire uv_enable = ~sw_uv_off;
 
-    //------------------------------------------------------------------
-    // 16x baud tick for the rx
-    //------------------------------------------------------------------
-    wire tick;
-    baud_tick_gen u_baud (
-        .clk (clk),
-        .rst (rst),
-        .tick(tick)
+    //==================================================================
+    // Modbus RTU master (drives JA4/tx, listens on JA3/rx)
+    //==================================================================
+    wire        mb_start;
+    wire [7:0]  mb_addr;
+    wire [7:0]  mb_func;
+    wire [15:0] mb_reg;
+    wire [15:0] mb_data;
+    wire        mb_busy;
+    wire        mb_done;
+    wire        mb_error;
+    wire [8*9-1:0] mb_resp;   // RESP_LEN = 9 (read response length)
+
+    modbus_rtu_master #(
+        .CLK_HZ     (CLK_HZ),
+        .BAUD       (BAUD),
+        .RESP_LEN   (9),
+        .TIMEOUT_MS (UV_TIMEOUT_MS)
+    ) u_mb (
+        .clk           (clk),
+        .rst           (rst),
+        .start         (mb_start),
+        .slave_addr    (mb_addr),
+        .func_code     (mb_func),
+        .reg_addr      (mb_reg),
+        .data_or_count (mb_data),
+        .busy          (mb_busy),
+        .done          (mb_done),
+        .error         (mb_error),
+        .resp_frame    (mb_resp),
+        .uart_tx_pin   (uv_cr),
+        .uart_rx_pin   (uv_dt)
     );
 
     //==================================================================
-    // UV channel : sync -> rx -> fifo
+    // Sequencer: boot config writes, then poll ALS
     //==================================================================
-    wire uv_rx_sync;
-    sync_2ff u_uv_sync (
-        .clk      (clk),
-        .rst      (rst),
-        .async_in (uv_dt),
-        .sync_out (uv_rx_sync)
-    );
+    wire [23:0] als;
+    wire        als_valid;
 
-    wire [FIFO_WIDTH-1:0] uv_rx_data;
-    wire                  uv_rx_wr_en;
-    wire                  uv_full;
-
-    rx u_uv_rx (
-        .clk        (clk),
-        .rst        (rst),
-        .RX         (uv_rx_sync),
-        .queue_full (uv_full),
-        .id         (UV_ID),
-        .tick       (tick),
-        .data_out   (uv_rx_data),
-        .wr_en      (uv_rx_wr_en)
-    );
-
-    // rx.wr_en stays high for a full baud-tick period; turn it into a
-    // single-clock write strobe so the FIFO writes each word exactly once.
-    reg  uv_wr_en_d;
-    always @(posedge clk) begin
-        if (rst) uv_wr_en_d <= 1'b0;
-        else     uv_wr_en_d <= uv_rx_wr_en;
-    end
-    wire uv_wr_pulse = uv_rx_wr_en & ~uv_wr_en_d & uv_enable;
-
-    wire [FIFO_WIDTH-1:0] uv_fifo_dout;
-    wire                  uv_empty;
-    wire                  uv_rd_en;
-
-    sync_fifo #(.DEPTH(FIFO_DEPTH), .DWIDTH(FIFO_WIDTH)) u_uv_fifo (
-        .rstn  (~rst),
-        .clk   (clk),
-        .wr_en (uv_wr_pulse),
-        .rd_en (uv_rd_en),
-        .din   (uv_rx_data),
-        .dout  (uv_fifo_dout),
-        .empty (uv_empty),
-        .full  (uv_full)
+    ltr390_seq #(
+        .BOOT_CYCLES(UV_BOOT_CYCLES),
+        .POLL_CYCLES(UV_POLL_CYCLES)
+    ) u_seq (
+        .clk           (clk),
+        .rst           (rst),
+        .enable        (uv_enable),
+        .start         (mb_start),
+        .slave_addr    (mb_addr),
+        .func_code     (mb_func),
+        .reg_addr      (mb_reg),
+        .data_or_count (mb_data),
+        .busy          (mb_busy),
+        .done          (mb_done),
+        .error         (mb_error),
+        .resp_frame    (mb_resp),
+        .als           (als),
+        .als_valid     (als_valid),
+        .booting       ()            // status output unused (LEDs removed)
     );
 
     //==================================================================
-    // UV trigger : echo_pulse_ctrl -> uart_tx (out on JA4 / C-R)
-    //==================================================================
-    wire uv_poll_pulse;
-    echo_pulse_ctrl #(
-        .CLK_HZ  (CLK_HZ),
-        .CYCLE_MS(UV_POLL_MS)
-    ) u_uv_echo (
-        .clk      (clk),
-        .rst      (rst),
-        .pulse_out(uv_poll_pulse)
-    );
-
-    wire uv_tx_busy;
-    reg  uv_tx_start;
-    always @(posedge clk) begin
-        if (rst) uv_tx_start <= 1'b0;
-        else     uv_tx_start <= uv_poll_pulse & uv_enable & ~uv_tx_busy;
-    end
-
-    uart_tx #(.CLK_HZ(CLK_HZ), .BAUD(BAUD)) u_uv_tx (
-        .clk     (clk),
-        .rst     (rst),
-        .tx_start(uv_tx_start),
-        .tx_data (UV_TRIGGER_CMD),
-        .tx      (uv_cr),
-        .busy    (uv_tx_busy)
-    );
-
-    //==================================================================
-    // Bluetooth output : drain the UV FIFO -> uart_tx
+    // Bluetooth output: frame each reading as 0xAA + 3 ALS bytes
     //==================================================================
     wire       bt_tx_busy;
     wire       bt_tx_start;
     wire [7:0] bt_tx_data;
 
-    fifo_bt_streamer #(.DWIDTH(FIFO_WIDTH)) u_streamer (
+    bt_als_framer u_framer (
         .clk      (clk),
         .rst      (rst),
-        .f_empty  (uv_empty),
-        .f_dout   (uv_fifo_dout),
-        .f_rd_en  (uv_rd_en),
+        .als_valid(als_valid),
+        .als      (als),
         .tx_busy  (bt_tx_busy),
         .tx_start (bt_tx_start),
         .tx_data  (bt_tx_data)
@@ -176,66 +145,199 @@ module main #(
         .busy    (bt_tx_busy)
     );
 
-    // bt_rx is wired to a pin for future host->hub commands; unused today.
-
     //==================================================================
-    // Debug status LEDs -- live map of the pipeline. Single-cycle events
-    // are stretched to ~0.1 s so they are visible.
-    //
-    //   LD0  heartbeat (~1.5 Hz)   design alive & clocked
-    //   LD1  UV input activity     UV sensor is sending serial on JA3
-    //   LD3  UV word captured      rx decoded a UV frame into the FIFO
-    //   LD5  UV FIFO non-empty     a UV word is queued
-    //   LD7  BT TX activity        bytes leaving toward the HM-10 on JC4
-    //   LD8  UV trigger firing     UV poll is transmitting on JA4
-    //   LD15 reset                 lit while held in reset
-    //   (LD2, LD4, LD6, LD9-LD14 unused -> 0)
+    // LD0 blinks (~0.1 s) each time a byte is transmitted over the
+    // Bluetooth link. All other LEDs are unused.
     //==================================================================
-    localparam integer BLINK_CYCLES = 10_000_000; // ~0.1 s @ 100 MHz
+    wire led_tx;
+    pulse_stretch #(.CYCLES(10_000_000)) s_tx (   // ~0.1 s visible blink @ 100 MHz
+        .clk (clk),
+        .rst (rst),
+        .trig(bt_tx_start),                       // one pulse per BT byte sent
+        .led (led_tx)
+    );
 
-    // Heartbeat: free-running counter, MSB blinks ~1.5 Hz.
-    reg [25:0] heartbeat;
-    always @(posedge clk) begin
-        if (rst) heartbeat <= 26'd0;
-        else     heartbeat <= heartbeat + 1'b1;
-    end
-
-    // Falling-edge detectors (UART start bits on the synced line / bt_tx).
-    reg uv_line_d, bt_tx_d;
-    always @(posedge clk) begin
-        uv_line_d <= uv_rx_sync;
-        bt_tx_d   <= bt_tx;
-    end
-    wire uv_line_fell = uv_line_d & ~uv_rx_sync;
-    wire bt_tx_fell   = bt_tx_d   & ~bt_tx;
-
-    wire led_uv_line, led_uv_word, led_uv_fifo, led_bt_tx, led_uv_trig;
-
-    pulse_stretch #(.CYCLES(BLINK_CYCLES)) s_uv_line (.clk(clk), .rst(rst), .trig(uv_line_fell), .led(led_uv_line));
-    pulse_stretch #(.CYCLES(BLINK_CYCLES)) s_uv_word (.clk(clk), .rst(rst), .trig(uv_wr_pulse),  .led(led_uv_word));
-    pulse_stretch #(.CYCLES(BLINK_CYCLES)) s_uv_fifo (.clk(clk), .rst(rst), .trig(~uv_empty),    .led(led_uv_fifo));
-    pulse_stretch #(.CYCLES(BLINK_CYCLES)) s_bt_tx   (.clk(clk), .rst(rst), .trig(bt_tx_fell),   .led(led_bt_tx));
-    pulse_stretch #(.CYCLES(BLINK_CYCLES)) s_uv_trig (.clk(clk), .rst(rst), .trig(uv_tx_start),  .led(led_uv_trig));
-
-    assign led[0]    = heartbeat[25];
-    assign led[1]    = led_uv_line;
-    assign led[2]    = 1'b0;
-    assign led[3]    = led_uv_word;
-    assign led[4]    = 1'b0;
-    assign led[5]    = led_uv_fifo;
-    assign led[6]    = 1'b0;
-    assign led[7]    = led_bt_tx;
-    assign led[8]    = led_uv_trig;
-    assign led[14:9] = 6'b0;
-    assign led[15]   = rst;
+    assign led[0]    = led_tx;
+    assign led[15:1] = 15'b0;
 
 endmodule
 
 
 //======================================================================
+// ltr390_seq -- command sequencer for the LTR390UV over modbus_rtu_master.
+//
+// On enable: wait BOOT_CYCLES, then issue the three ambient-light config
+// writes (func 0x06), then repeatedly issue the ALS read (func 0x04,
+// regs 0x07..0x08). Each read `done` extracts the 20-bit ALS value and
+// pulses als_valid.
+//
+// The master is instantiated with RESP_LEN=9 (the read-response length).
+// A write echo is only 8 bytes, so config writes end in the master's
+// timeout `error` rather than `done` -- that's expected and harmless
+// (the write still reached the sensor); the sequencer advances on either.
+//======================================================================
+module ltr390_seq #(
+    parameter integer BOOT_CYCLES = 20_000_000,
+    parameter integer POLL_CYCLES = 20_000_000
+) (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire        enable,
+
+    // to modbus_rtu_master
+    output reg         start,
+    output reg  [7:0]  slave_addr,
+    output reg  [7:0]  func_code,
+    output reg  [15:0] reg_addr,
+    output reg  [15:0] data_or_count,
+    input  wire        busy,
+    input  wire        done,
+    input  wire        error,
+    input  wire [8*9-1:0] resp_frame,
+
+    // reading out
+    output reg  [23:0] als,
+    output reg         als_valid,
+    output wire        booting
+);
+
+    localparam [7:0] SLAVE = 8'h1C;
+    localparam [7:0] FUNC_WRITE = 8'h06;
+    localparam [7:0] FUNC_READ  = 8'h04;
+
+    // step: 0,1,2 = config writes ; 3 = ALS read (poll)
+    localparam [2:0] S_DISABLED = 3'd0,
+                     S_BOOT     = 3'd1,
+                     S_ISSUE    = 3'd2,
+                     S_WAIT     = 3'd3,
+                     S_POLL     = 3'd4;
+
+    reg [2:0]  state;
+    reg [1:0]  step;
+    reg [31:0] delay;
+
+    assign booting = (state != S_DISABLED) && (step != 2'd3);
+
+    always @(posedge clk) begin
+        if (rst) begin
+            state <= S_DISABLED; step <= 2'd0; delay <= 0;
+            start <= 1'b0; slave_addr <= SLAVE; func_code <= FUNC_WRITE;
+            reg_addr <= 16'd0; data_or_count <= 16'd0;
+            als <= 24'd0; als_valid <= 1'b0;
+        end else if (!enable) begin
+            state <= S_DISABLED; start <= 1'b0; als_valid <= 1'b0;
+        end else begin
+            start     <= 1'b0;
+            als_valid <= 1'b0;
+
+            case (state)
+                S_DISABLED: begin
+                    step  <= 2'd0;
+                    delay <= BOOT_CYCLES;
+                    state <= S_BOOT;
+                end
+
+                S_BOOT: if (delay == 0) state <= S_ISSUE;
+                        else delay <= delay - 1'b1;
+
+                S_ISSUE: begin
+                    slave_addr <= SLAVE;
+                    case (step)
+                        2'd0: begin func_code <= FUNC_WRITE; reg_addr <= 16'h000D; data_or_count <= 16'h0022; end
+                        2'd1: begin func_code <= FUNC_WRITE; reg_addr <= 16'h0006; data_or_count <= 16'h0001; end
+                        2'd2: begin func_code <= FUNC_WRITE; reg_addr <= 16'h000E; data_or_count <= 16'h0002; end
+                        default: begin func_code <= FUNC_READ; reg_addr <= 16'h0007; data_or_count <= 16'h0002; end
+                    endcase
+                    start <= 1'b1;
+                    state <= S_WAIT;
+                end
+
+                S_WAIT: begin
+                    // transaction finishes with a done (success) or error
+                    // (CRC/echo/timeout) pulse. For config writes we accept
+                    // either; for the read, `done` carries valid data.
+                    if (done && step == 2'd3) begin
+                        // ALS raw = reg0 | (reg1<<16); read response layout:
+                        // [0]1C [1]04 [2]04 [3]r0hi [4]r0lo [5]r1hi [6]r1lo [7]crc [8]crc
+                        als <= {resp_frame[55:48],   // reg1 low  -> als[23:16]
+                                resp_frame[31:24],   // reg0 high -> als[15:8]
+                                resp_frame[39:32]};  // reg0 low  -> als[7:0]
+                        als_valid <= 1'b1;
+                    end
+                    if (done || error) begin
+                        if (step == 2'd3) begin
+                            delay <= POLL_CYCLES;
+                            state <= S_POLL;
+                        end else begin
+                            step  <= step + 1'b1;
+                            state <= S_ISSUE;
+                        end
+                    end
+                end
+
+                S_POLL: if (delay == 0) state <= S_ISSUE;  // re-issue read (step stays 3)
+                        else delay <= delay - 1'b1;
+
+                default: state <= S_DISABLED;
+            endcase
+        end
+    end
+
+endmodule
+
+
+//======================================================================
+// bt_als_framer -- send one reading as: 0xAA sync, als[23:16],
+// als[15:8], als[7:0], MSB first, via a shared uart_tx.
+//======================================================================
+module bt_als_framer (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire        als_valid,
+    input  wire [23:0] als,
+    input  wire        tx_busy,
+    output reg         tx_start,
+    output reg  [7:0]  tx_data
+);
+    localparam [7:0] SYNC = 8'hAA;
+    localparam [1:0] S_IDLE = 2'd0, S_REQ = 2'd1, S_WAIT = 2'd2, S_FIN = 2'd3;
+
+    reg [1:0]  state;
+    reg [1:0]  bidx;
+    reg [23:0] latched;
+
+    reg [7:0] cur;
+    always @(*) begin
+        case (bidx)
+            2'd0:    cur = SYNC;
+            2'd1:    cur = latched[23:16];
+            2'd2:    cur = latched[15:8];
+            default: cur = latched[7:0];
+        endcase
+    end
+
+    always @(posedge clk) begin
+        if (rst) begin
+            state <= S_IDLE; tx_start <= 1'b0; bidx <= 2'd0; tx_data <= 8'h00;
+        end else begin
+            tx_start <= 1'b0;
+            case (state)
+                S_IDLE: if (als_valid) begin latched <= als; bidx <= 2'd0; state <= S_REQ; end
+                S_REQ:  if (!tx_busy) begin tx_data <= cur; tx_start <= 1'b1; state <= S_WAIT; end
+                S_WAIT: if (tx_busy) state <= S_FIN;
+                S_FIN:  if (!tx_busy) begin
+                            if (bidx == 2'd3) state <= S_IDLE;
+                            else begin bidx <= bidx + 1'b1; state <= S_REQ; end
+                        end
+                default: state <= S_IDLE;
+            endcase
+        end
+    end
+endmodule
+
+
+//======================================================================
 // pulse_stretch -- holds `led` high for CYCLES clocks after each `trig`.
-// Retriggerable: a level input keeps it lit while active plus the tail.
-// Used only for making brief debug events visible on the LEDs.
 //======================================================================
 module pulse_stretch #(parameter integer CYCLES = 10_000_000) (
     input  wire clk,
@@ -246,130 +348,8 @@ module pulse_stretch #(parameter integer CYCLES = 10_000_000) (
     reg [31:0] cnt;
     always @(posedge clk) begin
         if (rst)           cnt <= 32'd0;
-        else if (trig)     cnt <= CYCLES;        // (re)load on event
-        else if (cnt != 0) cnt <= cnt - 32'd1;   // count down the tail
+        else if (trig)     cnt <= CYCLES;
+        else if (cnt != 0) cnt <= cnt - 32'd1;
     end
     assign led = (cnt != 0);
-endmodule
-
-
-//======================================================================
-// sync_2ff -- 2-flop synchronizer for an async UART input line.
-// Resets to 1 (UART idle level) so no false start bit is seen at reset.
-//======================================================================
-module sync_2ff (
-    input  wire clk,
-    input  wire rst,
-    input  wire async_in,
-    output wire sync_out
-);
-    reg meta, sync;
-    always @(posedge clk) begin
-        if (rst) begin
-            meta <= 1'b1;
-            sync <= 1'b1;
-        end else begin
-            meta <= async_in;
-            sync <= meta;
-        end
-    end
-    assign sync_out = sync;
-endmodule
-
-
-//======================================================================
-// fifo_bt_streamer
-//
-// Drains one FIFO of DWIDTH-bit words and pushes each word out as two
-// UART bytes via uart_tx:
-//
-//   high byte = {3'b000, id[1:0], parity_err, framing_err, overrun_err}
-//   low  byte = data_byte[7:0]
-//
-// matching the rx.v word layout {id, data_byte, parity, framing, overrun}.
-//
-// FIFO read timing (sync_fifo): rd_en pulses one cycle; dout is valid the
-// cycle after rd_en deasserts -- handled by the READ/CAP/LATCH steps.
-//======================================================================
-module fifo_bt_streamer #(
-    parameter integer DWIDTH = 13
-) (
-    input  wire              clk,
-    input  wire              rst,
-
-    input  wire              f_empty,
-    input  wire [DWIDTH-1:0] f_dout,
-    output reg               f_rd_en,
-
-    input  wire              tx_busy,
-    output reg               tx_start,
-    output reg  [7:0]        tx_data
-);
-
-    localparam [3:0] S_IDLE    = 4'd0,
-                     S_READ    = 4'd1,
-                     S_CAP     = 4'd2,
-                     S_LATCH   = 4'd3,
-                     S_HI_REQ  = 4'd4,
-                     S_HI_WAIT = 4'd5,
-                     S_HI_FIN  = 4'd6,
-                     S_LO_REQ  = 4'd7,
-                     S_LO_WAIT = 4'd8,
-                     S_LO_FIN  = 4'd9;
-
-    reg [3:0]        state;
-    reg [DWIDTH-1:0] word;
-
-    // Byte framing of the captured word.
-    wire [7:0] hi_byte = {3'b000, word[12:11], word[2], word[1], word[0]};
-    wire [7:0] lo_byte = word[10:3];
-
-    always @(posedge clk) begin
-        if (rst) begin
-            state    <= S_IDLE;
-            f_rd_en  <= 1'b0;
-            tx_start <= 1'b0;
-            tx_data  <= 8'h00;
-            word     <= {DWIDTH{1'b0}};
-        end else begin
-            // one-cycle strobes default low
-            f_rd_en  <= 1'b0;
-            tx_start <= 1'b0;
-
-            case (state)
-                S_IDLE: if (!f_empty) state <= S_READ;
-
-                S_READ: begin
-                    f_rd_en <= 1'b1;
-                    state   <= S_CAP;
-                end
-
-                S_CAP: state <= S_LATCH;   // rd_en high this cycle; dout latched at cycle end
-
-                S_LATCH: begin
-                    word  <= f_dout;
-                    state <= S_HI_REQ;
-                end
-
-                S_HI_REQ: if (!tx_busy) begin
-                    tx_data  <= hi_byte;
-                    tx_start <= 1'b1;
-                    state    <= S_HI_WAIT;
-                end
-                S_HI_WAIT: if (tx_busy) state <= S_HI_FIN;  // byte accepted
-                S_HI_FIN:  if (!tx_busy) state <= S_LO_REQ; // byte finished
-
-                S_LO_REQ: if (!tx_busy) begin
-                    tx_data  <= lo_byte;
-                    tx_start <= 1'b1;
-                    state    <= S_LO_WAIT;
-                end
-                S_LO_WAIT: if (tx_busy) state <= S_LO_FIN;
-                S_LO_FIN:  if (!tx_busy) state <= S_IDLE;
-
-                default: state <= S_IDLE;
-            endcase
-        end
-    end
-
 endmodule
